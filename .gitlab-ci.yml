@@ -1,0 +1,374 @@
+image: 28.4.0-alpine3.22
+
+services:
+  - docker:dind
+
+# Global variables
+variables:
+  MAVEN_OPTS: "-Dmaven.repo.local=$CI_PROJECT_DIR/.m2/repository"
+  MAVEN_CLI_OPTS: "--batch-mode --errors --fail-at-end --show-version"
+  # Docker image settings
+  IMAGE_TAG: $CI_REGISTRY_IMAGE:$CI_COMMIT_REF_SLUG
+  IMAGE_TAG2: $CI_REGISTRY_IMAGE:$CI_PIPELINE_IID
+  IMAGE_TAG_LATEST: $CI_REGISTRY_IMAGE:latest
+  # Instruct Testcontainers to use the daemon of DinD.
+  DOCKER_HOST: "tcp://docker:2375"
+  # Instruct Docker not to start over TLS.
+  DOCKER_TLS_CERTDIR: ""
+  # Improve performance with overlays.
+  DOCKER_DRIVER: overlay2
+  SONAR_USER_HOME: "${CI_PROJECT_DIR}/.sonar"  # Defines the location of the analysis task cache
+  GIT_DEPTH: "0"  # Tells git to fetch all the branches of the project, required by the analysis task
+
+# Cache Maven dependencies between jobs
+cache:
+  key: ${CI_COMMIT_REF_SLUG}
+  paths:
+    - .m2/repository/
+    - target/
+
+# ==========================================
+# BUILD STAGE
+# ==========================================
+
+stages:
+  - test
+  - sonarqube
+  - qodana
+  - package
+  - build jar
+  - build prod jar
+  - build and push docker image
+  - docker build prod
+  - deploy dev
+  - deploy prod
+
+test_job:
+  stage: test
+  image: maven:3.9.11-amazoncorretto-25-alpine
+  before_script:
+    - export MAX_LOG_SIZE=52428800 # Set log size limit to 50MB
+  script:
+    - pwd
+    - mvn clean compile test
+  only:
+    - merge_requests
+    - complete
+
+#sonarqube:
+#  image: maven:3.9.11-amazoncorretto-25-alpine
+#  stage: sonarqube
+#  variables:
+#    SONAR_USER_HOME: "${CI_PROJECT_DIR}/.sonar"  # Defines the location of the analysis task cache
+#    GIT_DEPTH: "0"  # Tells git to fetch all the branches of the project, required by the analysis task
+#  cache:
+#    key: "${CI_JOB_NAME}"
+#    paths:
+#      - .sonar/cache
+#  script:
+#    - mvn clean verify sonar:sonar -Dsonar.projectKey=kominfo-pemuda-persis_persis-service
+#  allow_failure: true
+#  only:
+#    - merge_requests
+#
+#qodana:
+#  stage: qodana
+#  image:
+#    name: jetbrains/qodana-jvm-community:2025.1
+#    entrypoint: [ "" ]
+#  cache:
+#    - key: qodana-2025.1-$CI_DEFAULT_BRANCH-$CI_COMMIT_REF_SLUG
+#      fallback_keys:
+#        - qodana-2025.1-$CI_DEFAULT_BRANCH-
+#        - qodana-2025.1-
+#      paths:
+#        - .qodana/cache
+#  variables:
+#    QODANA_TOKEN: $QODANA_TOKEN
+#    QODANA_ENDPOINT: "https://qodana.cloud"
+#  script:
+#    - qodana --cache-dir=$CI_PROJECT_DIR/.qodana/cache
+#  only:
+#    - merge_requests
+
+build:
+  image: maven:3.9.11-amazoncorretto-25-alpine
+  stage: build jar
+  before_script:
+    - source .dev.env
+  script:
+    - mvn clean install -Dspring.profiles.active=$SPRING_ACTIVE_PROFILE -DskipTests && mvn package -B -e -Dspring.profiles.active=prod -DskipTests
+  artifacts:
+    paths:
+      - target/*.jar
+  only:
+    - complete
+    - main
+
+package:jar:
+  stage: package
+  image: maven:3.9-amazoncorretto-25
+  script:
+    - echo "Packaging application as JAR..."
+    - mvn $MAVEN_CLI_OPTS package -DskipTests
+  artifacts:
+    paths:
+      - target/*.jar
+    expire_in: 30 days
+  only:
+    - main
+    - complete
+    - develop
+    - tags
+  tags:
+    - docker
+
+package:docker:
+  stage: package
+  image: maven:3.9-amazoncorretto-25
+  script:
+    - echo "Building Docker image with Jib (no Docker daemon required)..."
+    - |
+      mvn $MAVEN_CLI_OPTS compile jib:build \
+        -Djib.to.image=$IMAGE_TAG2 \
+        -Djib.to.tags=$CI_COMMIT_SHORT_SHA,$CI_PIPELINE_IID,latest \
+        -Djib.to.auth.username=$CI_REGISTRY_USER \
+        -Djib.to.auth.password=$CI_REGISTRY_PASSWORD
+    - echo "Docker image pushed to $IMAGE_TAG2"
+  only:
+    - main
+    - develop
+    - complete
+    - tags
+  tags:
+    - docker
+
+build prod:
+  image: docker:28.4.0-alpine3.22
+  services:
+    - docker:28.4.0-dind-alpine3.22
+  stage: build prod jar
+  environment:
+    name: production
+    url: https://api.persis.or.id
+  before_script:
+    - echo "$env_prod" > .env_prod
+    - source .env_prod
+    - touch docker/app/.env
+    # Ensure build scripts are executable
+    - chmod +x docker/app/builder_prod.sh
+    - chmod +x docker/app/builder.sh
+    # Install Docker Compose
+    - apk add --no-cache curl
+    - curl -L "https://github.com/docker/compose/releases/download/v2.24.1/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
+    - chmod +x /usr/local/bin/docker-compose
+    - docker --version && docker-compose --version
+  script:
+    - docker compose -f docker/app/compose.yml run builder_prod;
+  artifacts:
+    paths:
+      - target/*.jar
+  cache:
+    key: build_${CI_PROJECT_NAME}
+    paths:
+      - ./maven/.m2/repository
+  only:
+    - /-RELEASE$/
+
+docker build:
+  image: docker:28.4.0-alpine3.22
+  stage: build and push docker image
+  services:
+    - docker:28-dind
+  before_script:
+    - echo "$env_gitlab" > .env_gitlab
+    - source .env_gitlab
+    - apk add --no-cache curl jq aws-cli
+    - |
+      # Validate required variables
+      if [ -z "$REPOSITORY_URL" ]; then
+        echo "ERROR: REPOSITORY_URL is not set!"
+        echo "Please check your env_gitlab variable in GitLab CI/CD settings"
+        exit 1
+      fi
+      if [ -z "$ECR_URL" ]; then
+        echo "ERROR: ECR_URL is not set!"
+        exit 1
+      fi
+      echo "Using repository: $REPOSITORY_URL:$CI_PIPELINE_IID"
+  script:
+    - echo "Logging into AWS ECR..."
+    - aws ecr get-login-password --region ap-southeast-1 | docker login --username AWS --password-stdin $ECR_URL
+    - echo "Building Docker image..."
+    - docker build -t $REPOSITORY_URL:$CI_PIPELINE_IID .
+    - echo "Pushing to ECR..."
+    - docker push $REPOSITORY_URL:$CI_PIPELINE_IID
+    - echo "Successfully pushed $REPOSITORY_URL:$CI_PIPELINE_IID"
+  only:
+    - complete
+    - main
+
+docker build prod:
+  environment:
+    name: production
+    url: https://api.persis.or.id
+  only:
+    - /-RELEASE$/
+  image: docker:28.4.0-alpine3.22
+  services:
+    - docker:28-dind
+  stage: docker build prod
+  before_script:
+    - echo "$ENV_GITLAB" > .env_gitlab
+    - source .env_gitlab
+    - apk add --no-cache curl jq aws-cli
+    - |
+      # Validate required variables
+      if [ -z "$REPOSITORY_URL" ]; then
+        echo "ERROR: REPOSITORY_URL is not set!"
+        echo "Please check your ENV_GITLAB variable in GitLab CI/CD settings"
+        exit 1
+      fi
+      if [ -z "$ECR_URL" ]; then
+        echo "ERROR: ECR_URL is not set!"
+        exit 1
+      fi
+      echo "Using repository: $REPOSITORY_URL:$CI_COMMIT_REF_NAME"
+  script:
+    - echo "Logging into AWS ECR..."
+    - aws ecr get-login-password --region ap-southeast-1 | docker login --username AWS --password-stdin $ECR_URL
+    - echo "Building production Docker image..."
+    - docker build --network host -t $REPOSITORY_URL:$CI_COMMIT_REF_NAME .
+    - echo "Pushing to ECR..."
+    - docker push $REPOSITORY_URL:$CI_COMMIT_REF_NAME
+    - echo "Successfully pushed $REPOSITORY_URL:$CI_COMMIT_REF_NAME"
+
+docker push to docker hub:
+  image: docker:28.4.0-alpine3.22
+  stage: docker build prod
+  services:
+    - docker:28-dind
+  before_script:
+    - |
+      # Validate Docker Hub credentials
+      if [ -z "$DOCKER_HUB_USERNAME" ]; then
+        echo "ERROR: DOCKER_HUB_USERNAME is not set!"
+        echo "Please add DOCKER_HUB_USERNAME to GitLab CI/CD Variables"
+        exit 1
+      fi
+      if [ -z "$DOCKER_HUB_PASSWORD" ]; then
+        echo "ERROR: DOCKER_HUB_PASSWORD is not set!"
+        echo "Please add DOCKER_HUB_PASSWORD to GitLab CI/CD Variables"
+        exit 1
+      fi
+    - echo "Logging into Docker Hub as $DOCKER_HUB_USERNAME..."
+    - echo "$DOCKER_HUB_PASSWORD" | docker login -u "$DOCKER_HUB_USERNAME" --password-stdin
+    - echo "Docker Hub login successful!"
+  script:
+    - echo "Building Docker image for Docker Hub..."
+    - docker build -t $DOCKER_HUB_USERNAME/movie-trailer:$CI_PIPELINE_IID .
+    - docker tag $DOCKER_HUB_USERNAME/movie-trailer:$CI_PIPELINE_IID $DOCKER_HUB_USERNAME/movie-trailer:latest
+    - echo "Pushing to Docker Hub..."
+    - docker push $DOCKER_HUB_USERNAME/movie-trailer:$CI_PIPELINE_IID
+    - docker push $DOCKER_HUB_USERNAME/movie-trailer:latest
+    - echo "Successfully pushed to Docker Hub!"
+    - echo "Images available at:"
+    - echo "  - docker pull $DOCKER_HUB_USERNAME/movie-trailer:$CI_PIPELINE_IID"
+    - echo "  - docker pull $DOCKER_HUB_USERNAME/movie-trailer:latest"
+  only:
+    - complete
+    - main
+  allow_failure: false
+
+docker push to docker hub prod:
+  environment:
+    name: production
+    url: https://hub.docker.com/r/$DOCKER_HUB_USERNAME/movie-trailer
+  image: docker:28.4.0-alpine3.22
+  stage: docker build prod
+  services:
+    - docker:28-dind
+  before_script:
+    - |
+      # Validate Docker Hub credentials
+      if [ -z "$DOCKER_HUB_USERNAME" ]; then
+        echo "ERROR: DOCKER_HUB_USERNAME is not set!"
+        echo "Please add DOCKER_HUB_USERNAME to GitLab CI/CD Variables"
+        exit 1
+      fi
+      if [ -z "$DOCKER_HUB_PASSWORD" ]; then
+        echo "ERROR: DOCKER_HUB_PASSWORD is not set!"
+        echo "Please add DOCKER_HUB_PASSWORD to GitLab CI/CD Variables"
+        exit 1
+      fi
+    - echo "Logging into Docker Hub as $DOCKER_HUB_USERNAME..."
+    - echo "$DOCKER_HUB_PASSWORD" | docker login -u "$DOCKER_HUB_USERNAME" --password-stdin
+    - echo "Docker Hub login successful!"
+  script:
+    - echo "Building production Docker image for Docker Hub..."
+    - docker build --network host -t $DOCKER_HUB_USERNAME/movie-trailer:$CI_COMMIT_REF_NAME .
+    - docker tag $DOCKER_HUB_USERNAME/movie-trailer:$CI_COMMIT_REF_NAME $DOCKER_HUB_USERNAME/movie-trailer:production
+    - echo "Pushing production image to Docker Hub..."
+    - docker push $DOCKER_HUB_USERNAME/movie-trailer:$CI_COMMIT_REF_NAME
+    - docker push $DOCKER_HUB_USERNAME/movie-trailer:production
+    - echo "Successfully pushed production image to Docker Hub!"
+    - echo "Images available at:"
+    - echo "  - docker pull $DOCKER_HUB_USERNAME/movie-trailer:$CI_COMMIT_REF_NAME"
+    - echo "  - docker pull $DOCKER_HUB_USERNAME/movie-trailer:production"
+  only:
+    - /-RELEASE$/
+  allow_failure: false
+
+deploy dev:
+  image: ubuntu:latest
+  stage: deploy dev
+  before_script:
+    - echo "$ENV_GITLAB" > .env_gitlab
+    - source .env_gitlab
+    - echo "$ENV_DEV" > .env
+    - echo REPOSITORY_ECR_URL=$REPOSITORY_ECR_URL >> .env
+    - echo TAG_NUMBER=$CI_PIPELINE_IID >> .env
+    - 'which ssh-agent || ( apt-get update -y && apt-get install openssh-client -y && apt-get -y install rsync)'
+    - eval $(ssh-agent -s)
+    - echo "$SSH_PRIVATE_KEY" | tr -d '\r' | ssh-add -
+    - mkdir -p ~/.ssh
+    - chmod 700 ~/.ssh
+    - echo -e "Host *\n\tStrictHostKeyChecking no\n\n" > ~/.ssh/config
+    - ssh $USER_DEV@$SERVER_DEV "[ -d ~/movie-trailer ] || mkdir ~/movie-trailer"
+    - rsync -avuz $CI_PROJECT_DIR/.env $USER_DEV@$SERVER_DEV:~/movie-trailer/.env
+    - rsync -avuz $CI_PROJECT_DIR/docker/docker-compose-dev.yml $USER_DEV@$SERVER_DEV:~/movie-trailer/docker-compose.yml
+  script:
+    - pwd
+    - ssh $USER_DEV@$SERVER_DEV "eval aws ecr get-login-password --region ap-southeast-1 | docker login --username $ECR_USERNAME --password-stdin $ECR_URL; cd ~/movie-trailer; docker compose --env-file .env -f docker-compose.yml down; docker system prune -af; docker pull $REPOSITORY_ECR_URL:$CI_PIPELINE_IID; docker compose --env-file .env -f docker-compose.yml up -d"
+  only:
+    - complete
+    - main
+
+deploy prod:
+  environment:
+    name: production
+    url: https://movie.jvm.my.id
+  image: ubuntu:latest
+  stage: deploy prod
+  before_script:
+    - echo "$env_gitlab" > .env_gitlab
+    - source .env_gitlab
+    - echo "$env_prod" > .env
+    - echo REPOSITORY_ECR_URL=$REPOSITORY_ECR_URL >> .env
+    - echo TAG_NUMBER=$CI_COMMIT_REF_NAME >> .env
+    - 'which ssh-agent || ( apt-get update -y && apt-get install openssh-client -y && apt-get -y install rsync)'
+    - eval $(ssh-agent -s)
+    - echo "$SSH_PRIVATE_KEY_PROD" | tr -d '\r' | ssh-add -
+    - mkdir -p ~/.ssh
+    - chmod 700 ~/.ssh
+    - echo -e "Host *\n\tStrictHostKeyChecking no\n\n" > ~/.ssh/config
+    - ssh $USER_PROD@$SERVER_PROD "[ -d /opt/movie-trailer ] || mkdir /opt/movie-trailer"
+    - rsync -avuz $CI_PROJECT_DIR/.env $USER_PROD@$SERVER_PROD:/opt/movie-trailer/.env
+    - rsync -avuz $CI_PROJECT_DIR/docker-compose.prod.yml $USER_PROD@$SERVER_PROD:/opt/movie-trailer/docker-compose.yml
+  script:
+    - ssh $USER_PROD@$SERVER_PROD "docker compose --env-file $COMPOSE_ENV_PATH -f $COMPOSE_YML_PATH down"
+    - ssh $USER_PROD@$SERVER_PROD "docker system prune -af"
+    - ssh $USER_PROD@$SERVER_PROD "docker pull $REPOSITORY_ECR_URL:$CI_COMMIT_REF_NAME"
+    - ssh $USER_PROD@$SERVER_PROD "docker compose --env-file $COMPOSE_ENV_PATH -f $COMPOSE_YML_PATH up -d"
+  only:
+    - /-RELEASE$/

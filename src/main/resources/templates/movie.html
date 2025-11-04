@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html layout:decorate="~{master.html}"
+      xmlns:layout="http://www.ultraq.net.nz/thymeleaf/layout"
+      xmlns:th="http://www.thymeleaf.org">
+<head>
+    <meta charset="utf-8">
+    <title>[[${movie.title}]]</title>
+</head>
+<body>
+
+<div layout:fragment="content" th:object="${movie}">
+    <div class="row align-items-center">
+        <div class="col-md-6 mb-4">
+            <img class="movie-detail-img img-fluid w-100"
+                 th:alt="*{title}" th:src="@{/assets/{filename}(filename=*{routeCover})}">
+        </div>
+        <div class="col-md-6 movie-info">
+            <h2 th:text="*{title}"></h2>
+
+            <!-- Genre Badges -->
+            <div class="mb-4">
+                <span class="badge me-2 mb-2"
+                      th:each="genre : *{genres}" th:text="${genre.title}"></span>
+            </div>
+
+            <!-- Synopsis -->
+            <div class="mb-4">
+                <p th:text="*{sinopsis}"></p>
+            </div>
+
+            <!-- Premiere Date -->
+            <div class="mb-4">
+                <small class="text-muted">
+                    <strong>Premiere Date:</strong>
+                    <span th:text="*{#temporals.format(premiereDate,'dd MMMM yyyy')}"></span>
+                </small>
+            </div>
+
+            <!-- Watch Trailer Button -->
+            <div class="text-center text-md-start">
+                <a class="btn btn-danger btn-lg"
+                   data-fancybox=""
+                   th:href="@{https://www.youtube.com/watch?v={youtubeId}(youtubeId=*{youtubeTrailerId})}">
+                    <svg class="bi bi-play-circle-fill" fill="currentColor" height="20"
+                         viewBox="0 0 16 16" width="20" xmlns="http://www.w3.org/2000/svg">
+                        <path d="M16 8A8 8 0 1 1 0 8a8 8 0 0 1 16 0zM6.79 5.093A.5.5 0 0 0 6 5.5v5a.5.5 0 0 0 .79.407l3.5-2.5a.5.5 0 0 0 0-.814l-3.5-2.5z"/>
+                    </svg>
+                    Watch Trailer
+                </a>
+            </div>
+        </div>
+    </div>
+</div>
+
+
+</body>
+</html>

@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html layout:decorate="~{master.html}"
+      xmlns:layout="http://www.ultraq.net.nz/thymeleaf/layout"
+      xmlns:th="http://www.thymeleaf.org">
+<head>
+    <meta charset="utf-8">
+    <title th:inline="text">Movies</title>
+</head>
+<body>
+
+<div layout:fragment="content">
+    <!-- Page Header -->
+    <h4 class="section-title">All Movies</h4>
+
+    <!-- Movies Grid -->
+    <div class="row">
+        <div class="col-md-3 col-sm-6 my-4" th:each="movie : ${movies}" th:object="${movie}">
+            <a class="movie-card" th:href="@{/movies/{id}(id=*{id})}">
+                <img class="card-img-top" th:alt="*{title}" th:src="@{/assets/{filename}(filename=*{routeCover})}">
+                <div class="card-body">
+                    <h2 class="card-title fs-6" th:text="*{title}"></h2>
+                    <p class="text-muted small" th:text="*{#temporals.format(premiereDate,'dd/MM/yyyy')}"></p>
+                </div>
+            </a>
+        </div>
+    </div>
+
+    <!-- Pagination -->
+    <div class="row mt-5" th:with="page=${movies}">
+        <div class="col-12">
+            <div sd:pagination-sumary></div>
+        </div>
+        <div class="col-12">
+            <nav>
+                <ul class="pagination justify-content-center" sd:pagination="full"></ul>
+            </nav>
+        </div>
+    </div>
+</div>
+
+
+</body>
+</html>
